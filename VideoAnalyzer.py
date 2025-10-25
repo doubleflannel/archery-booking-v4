@@ -52,6 +52,11 @@ class VideoAnalyzer:
         ).astype(np.float32)
         self.dt_scale = 0.5
 
+        # Output ROI configuration (cropped video for faster I/O)
+        self.output_width = min(1024, self.frame_w)
+        self.output_height = min(1024, self.frame_h)
+        self.output_center = np.array([self.frame_w / 2.0, self.frame_h / 2.0], dtype=np.float32)
+
         # Tracking state
         self.prev_gray = None
         self.tracks_prev = None  # previous frame tracked points
@@ -114,6 +119,24 @@ class VideoAnalyzer:
         pts = cv2.goodFeaturesToTrack(gray, maxCorners=self.seed_points, qualityLevel=0.01,
                                       minDistance=10, mask=mask, blockSize=7, useHarrisDetector=False)
         self.tracks_prev = pts
+
+    def _compute_output_roi_bounds(self):
+        half_w = self.output_width / 2.0
+        half_h = self.output_height / 2.0
+        cx = float(self.output_center[0])
+        cy = float(self.output_center[1])
+        x0 = int(round(cx - half_w))
+        y0 = int(round(cy - half_h))
+        x0 = max(0, min(self.frame_w - self.output_width, x0))
+        y0 = max(0, min(self.frame_h - self.output_height, y0))
+        x1 = x0 + self.output_width
+        y1 = y0 + self.output_height
+        return x0, y0, x1, y1
+
+    def _extract_output_roi(self, frame):
+        x0, y0, x1, y1 = self._compute_output_roi_bounds()
+        roi = frame[y0:y1, x0:x1]
+        return roi, (x0, y0, x1, y1)
 
     def _reacquire(self, frame, prefer_roi=True, gray=None):
         '''Try to detect and lock a new homography using SIFT + BF; optionally restricted to ROI.'''
@@ -222,12 +245,14 @@ class VideoAnalyzer:
             _, warped_edges = geo2D.calc_vertices_and_edges(warped_transform)
             scale = geo2D.calc_model_scale(warped_edges, self.model.shape)
             sub_target = visuals.subtract_background(warped_img, frame)
-            self.telemetry_sections['radial_warp_subtract'] += time.perf_counter() - warp_start
+            warp_elapsed = time.perf_counter() - warp_start
+            self.telemetry_sections['radial_warp_subtract'] += warp_elapsed
 
             estimated_warped_radius = self.rings_amount * self.inner_diam * scale[2]
             ring_radii = [r * scale[2] for r in self.ring_radii_model]
             circle_radius = ring_radii[-1]
 
+            roi_start = time.perf_counter()
             roi_margin = int(circle_radius * 0.15) + 8
             x0 = max(0, int(round(bullseye_point[0] - circle_radius - roi_margin)))
             x1 = min(self.frame_w, int(round(bullseye_point[0] + circle_radius + roi_margin)))
@@ -235,11 +260,13 @@ class VideoAnalyzer:
             y1 = min(self.frame_h, int(round(bullseye_point[1] + circle_radius + roi_margin)))
             if x1 <= x0 or y1 <= y0:
                 x0, y0, x1, y1 = 0, 0, self.frame_w, self.frame_h
+            roi_elapsed = time.perf_counter() - roi_start
 
             distance_start = time.perf_counter()
             warped_distances = cv2.warpPerspective(
                 self.distance_template, self.H, (self.frame_w, self.frame_h))
-            self.telemetry_sections['radial_distance_map'] += time.perf_counter() - distance_start
+            distance_elapsed = time.perf_counter() - distance_start
+            self.telemetry_sections['radial_distance_map'] += distance_elapsed
             pixel_distances_full = (None, warped_distances)
             dist_roi = warped_distances[y0:y1, x0:x1]
 
@@ -249,6 +276,7 @@ class VideoAnalyzer:
             proc_scale = getattr(self, 'dt_scale', 0.5)
             if proc_scale <= 0:
                 proc_scale = 1.0
+            downsample_start = time.perf_counter()
             if proc_scale != 1.0:
                 proc_w = max(1, int(round((x1 - x0) * proc_scale)))
                 proc_h = max(1, int(round((y1 - y0) * proc_scale)))
@@ -271,8 +299,12 @@ class VideoAnalyzer:
                 bullseye_proc = bullseye_roi
                 estimated_radius_proc = estimated_warped_radius
                 circle_radius_proc = circle_radius
+            downsample_elapsed = time.perf_counter() - downsample_start
 
             pixel_distances_proc = (None, dist_proc)
+            ring_before = self.telemetry_sections['radial_ring_estimate']
+            thresh_before = self.telemetry_sections['radial_threshold_morph']
+            line_before = self.telemetry_sections['radial_line_detect']
             circle_radius_proc, emphasized_proc = visuals.emphasize_lines(
                 sub_proc,
                 pixel_distances_proc,
@@ -280,11 +312,15 @@ class VideoAnalyzer:
                 telemetry=self.telemetry_sections,
                 ring_radius=circle_radius_proc,
             )
+            ring_delta = self.telemetry_sections['radial_ring_estimate'] - ring_before
+            thresh_delta = self.telemetry_sections['radial_threshold_morph'] - thresh_before
+            line_delta = self.telemetry_sections['radial_line_detect'] - line_before
 
             contour_start = time.perf_counter()
             proj_contours_proc = visuals.reproduce_proj_contours(
                 emphasized_proc, pixel_distances_proc, bullseye_proc, circle_radius_proc)
-            self.telemetry_sections['radial_contour_reconstruct'] += time.perf_counter() - contour_start
+            contour_elapsed = time.perf_counter() - contour_start
+            self.telemetry_sections['radial_contour_reconstruct'] += contour_elapsed
 
             scale_back = (1.0 / proc_scale) if proc_scale != 0 else 1.0
             proj_contours = []
@@ -295,29 +331,39 @@ class VideoAnalyzer:
                 proj_contours.append(cont_scaled.astype(np.int32))
 
             if not proj_contours:
+                fallback_start = time.perf_counter()
                 circle_radius_full, emphasized_full = visuals.emphasize_lines(
                     sub_target_roi,
                     (None, dist_roi),
                     estimated_warped_radius,
-                    telemetry=None,
+                    telemetry=self.telemetry_sections,
                     ring_radius=circle_radius,
                 )
                 fallback_contours = visuals.reproduce_proj_contours(
                     emphasized_full, (None, dist_roi), bullseye_roi, circle_radius)
+                fallback_elapsed = time.perf_counter() - fallback_start
+                self.telemetry_sections['radial_contour_reconstruct'] += fallback_elapsed
+                self.telemetry_sections['radial_ring_estimate'] += 0.0
+                proj_contours = []
                 for cont in fallback_contours:
                     cont = cont.astype(np.float32)
                     cont[..., 0] += x0
                     cont[..., 1] += y0
                     proj_contours.append(cont.astype(np.int32))
-
-            min_area = max(25.0, (circle_radius * 0.025) ** 2)
-            filtered_contours = [c for c in proj_contours if cv2.contourArea(c) >= min_area]
-            if filtered_contours:
-                proj_contours = filtered_contours
-
+                contour_elapsed += fallback_elapsed
             pixel_distances = pixel_distances_full
 
-            self.telemetry_sections['radial_filtering'] += time.perf_counter() - radial_total_start
+            radial_total = (
+                warp_elapsed
+                + roi_elapsed
+                + distance_elapsed
+                + downsample_elapsed
+                + ring_delta
+                + thresh_delta
+                + line_delta
+                + contour_elapsed
+            )
+            self.telemetry_sections['radial_filtering'] += radial_total
 
             scoring_start = time.perf_counter()
             suspect_hits = visuals.find_suspect_hits(proj_contours, warped_vertices, scale)
@@ -353,7 +399,7 @@ class VideoAnalyzer:
         self._run_perf_start = time.perf_counter()
 
         # set output configurations
-        frame_size = (self.frame_w, self.frame_h)
+        frame_size = (self.output_width, self.output_height)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(outputName, fourcc, 24.0, frame_size)
 
@@ -398,11 +444,15 @@ class VideoAnalyzer:
                 overlay_elapsed = time.perf_counter() - overlay_start
                 self.telemetry_sections['bookkeeping_overlay'] += overlay_elapsed
 
+                if bullseye is not None:
+                    self.output_center = np.array(bullseye, dtype=np.float32)
+
                 io_start = time.perf_counter()
-                frame_resized = cv2.resize(frame, (1153, 648))
-                cv2.imshow('Analysis', frame_resized)
-                out.write(frame)
+                roi_frame, _ = self._extract_output_roi(frame)
+                # show ROI for QC
+                cv2.imshow("Analysis", roi_frame)
                 key = cv2.waitKey(1) & 0xff
+                out.write(roi_frame)
                 io_elapsed = time.perf_counter() - io_start
                 self.telemetry_sections['bookkeeping_io'] += io_elapsed
 
@@ -415,8 +465,6 @@ class VideoAnalyzer:
                 )
                 self.telemetry_sections['bookkeeping'] += elapsed
                 self.telemetry_sections['frame_total'] = self.telemetry_sections.get('frame_total', 0.0) + (frame_end - frame_start)
-                if key == 27:
-                    break
             else:
                 print('Video stream is over.')
                 break
@@ -425,6 +473,9 @@ class VideoAnalyzer:
         if self._run_perf_start is not None:
             self.total_runtime = time.perf_counter() - self._run_perf_start
         self.telemetry_sections['run_clock'] = self.total_runtime
+        frame_total = self.telemetry_sections.get('frame_total', 0.0)
+        post_processing = max(0.0, self.total_runtime - frame_total)
+        self.telemetry_sections['post_processing'] = post_processing
 
         verified_hits_final = list(hitsMngr.get_hits(hitsMngr.VERIFIED))
         scoreboard_path = Scoreboard.write_run_report(
@@ -442,5 +493,8 @@ class VideoAnalyzer:
         out.release()
         cv2.destroyAllWindows()
         cv2.waitKey(1)
+
+
+
 
 

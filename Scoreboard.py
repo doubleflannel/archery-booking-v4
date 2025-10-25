@@ -84,8 +84,8 @@ def write_run_report(
     component_total = 0.0
     run_clock = run_duration
     if telemetry:
-        component_keys = ["target_detection", "radial_filtering", "hit_scoring", "bookkeeping"]
-        component_total = sum(float(telemetry.get(k, 0.0)) for k in component_keys)
+        frame_total = float(telemetry.get("frame_total", run_duration))
+        component_total = frame_total
         run_clock = float(telemetry.get("run_clock", run_duration))
     variance_percent = 0.0
     if run_clock > 0 and telemetry:
@@ -119,10 +119,18 @@ def write_run_report(
         ("bookkeeping_overlay", "    Bookkeeping: Overlay/Draw"),
         ("bookkeeping_io", "    Bookkeeping: I/O (Resize/Display/Write)"),
         ("bookkeeping_idle", "    Bookkeeping: Idle/Unaccounted"),
+        ("post_processing", "Run Postprocessing"),
     ]
     for key, label in telemetry_labels:
         value = float(telemetry.get(key, 0.0)) if telemetry else 0.0
         lines.append(f"  - {label}: {_format_minutes_seconds(value)}")
+
+    if telemetry:
+        frame_total_fmt = _format_minutes_seconds(frame_total)
+        run_clock_fmt = _format_minutes_seconds(run_clock)
+        lines.append("")
+        lines.append(f"Frame total (sum of frames): {frame_total_fmt}")
+        lines.append(f"Run clock (start→stop): {run_clock_fmt}")
 
     lines.append("")
     lines.append("Ends (5 arrows per end):")
