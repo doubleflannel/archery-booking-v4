@@ -1,0 +1,17 @@
+Run timestamp: 2025-10-24T17:43:29
+Run duration: 8m 17.305s
+Verified hits: 4
+Grand total: 30
+
+Telemetry (seconds):
+  - Target Detection: 0m 42.016s
+  - Radial Filtering: 6m 53.485s
+  - Hit Scoring: 0m 05.105s
+  - Bookkeeping: 0m 22.733s
+
+Ends (5 arrows per end):
++-----+---------+---------+---------+---------+---------+-------+
+| End | Arrow 1 | Arrow 2 | Arrow 3 | Arrow 4 | Arrow 5 | Total |
++-----+---------+---------+---------+---------+---------+-------+
+| 1   | 9       | 7       | 7       | 7       | -       | 30    |
++-----+---------+---------+---------+---------+---------+-------+

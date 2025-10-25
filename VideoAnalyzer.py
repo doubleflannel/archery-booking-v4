@@ -44,6 +44,13 @@ class VideoAnalyzer:
         self.model_keys, self.model_desc = self.sift.detectAndCompute(self.pad_model_gray, None)
 
         self.ring_radii_model = [self.inner_diam * (i + 1) for i in range(self.rings_amount)]
+        pad_h, pad_w = self.pad_model_gray.shape
+        yy, xx = np.indices((pad_h, pad_w), dtype=np.float32)
+        bullseye_template = self.anchor_points[5][0]
+        self.distance_template = np.sqrt(
+            (xx - bullseye_template[0]) ** 2 + (yy - bullseye_template[1]) ** 2
+        ).astype(np.float32)
+        self.dt_scale = 0.5
 
         # Tracking state
         self.prev_gray = None
@@ -217,27 +224,106 @@ class VideoAnalyzer:
             sub_target = visuals.subtract_background(warped_img, frame)
             self.telemetry_sections['radial_warp_subtract'] += time.perf_counter() - warp_start
 
-            distance_start = time.perf_counter()
-            pixel_distances = geo2D.calc_distances_from(frame.shape, bullseye_point)
-            self.telemetry_sections['radial_distance_map'] += time.perf_counter() - distance_start
-
             estimated_warped_radius = self.rings_amount * self.inner_diam * scale[2]
             ring_radii = [r * scale[2] for r in self.ring_radii_model]
             circle_radius = ring_radii[-1]
-            circle_radius, emphasized_lines = visuals.emphasize_lines(
-                sub_target, pixel_distances, estimated_warped_radius,
-                telemetry=self.telemetry_sections, ring_radius=circle_radius)
+
+            roi_margin = int(circle_radius * 0.15) + 8
+            x0 = max(0, int(round(bullseye_point[0] - circle_radius - roi_margin)))
+            x1 = min(self.frame_w, int(round(bullseye_point[0] + circle_radius + roi_margin)))
+            y0 = max(0, int(round(bullseye_point[1] - circle_radius - roi_margin)))
+            y1 = min(self.frame_h, int(round(bullseye_point[1] + circle_radius + roi_margin)))
+            if x1 <= x0 or y1 <= y0:
+                x0, y0, x1, y1 = 0, 0, self.frame_w, self.frame_h
+
+            distance_start = time.perf_counter()
+            warped_distances = cv2.warpPerspective(
+                self.distance_template, self.H, (self.frame_w, self.frame_h))
+            self.telemetry_sections['radial_distance_map'] += time.perf_counter() - distance_start
+            pixel_distances_full = (None, warped_distances)
+            dist_roi = warped_distances[y0:y1, x0:x1]
+
+            sub_target_roi = sub_target[y0:y1, x0:x1]
+            bullseye_roi = (bullseye_point[0] - x0, bullseye_point[1] - y0)
+
+            proc_scale = getattr(self, 'dt_scale', 0.5)
+            if proc_scale <= 0:
+                proc_scale = 1.0
+            if proc_scale != 1.0:
+                proc_w = max(1, int(round((x1 - x0) * proc_scale)))
+                proc_h = max(1, int(round((y1 - y0) * proc_scale)))
+                sub_proc = cv2.resize(
+                    sub_target_roi,
+                    (proc_w, proc_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                dist_proc = cv2.resize(
+                    dist_roi,
+                    (proc_w, proc_h),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                bullseye_proc = (bullseye_roi[0] * proc_scale, bullseye_roi[1] * proc_scale)
+                estimated_radius_proc = estimated_warped_radius * proc_scale
+                circle_radius_proc = circle_radius * proc_scale
+            else:
+                sub_proc = sub_target_roi
+                dist_proc = dist_roi
+                bullseye_proc = bullseye_roi
+                estimated_radius_proc = estimated_warped_radius
+                circle_radius_proc = circle_radius
+
+            pixel_distances_proc = (None, dist_proc)
+            circle_radius_proc, emphasized_proc = visuals.emphasize_lines(
+                sub_proc,
+                pixel_distances_proc,
+                estimated_radius_proc,
+                telemetry=self.telemetry_sections,
+                ring_radius=circle_radius_proc,
+            )
 
             contour_start = time.perf_counter()
-            proj_contours = visuals.reproduce_proj_contours(
-                emphasized_lines, pixel_distances, bullseye_point, circle_radius)
+            proj_contours_proc = visuals.reproduce_proj_contours(
+                emphasized_proc, pixel_distances_proc, bullseye_proc, circle_radius_proc)
             self.telemetry_sections['radial_contour_reconstruct'] += time.perf_counter() - contour_start
+
+            scale_back = (1.0 / proc_scale) if proc_scale != 0 else 1.0
+            proj_contours = []
+            for cont in proj_contours_proc:
+                cont_scaled = cont.astype(np.float32) * scale_back
+                cont_scaled[..., 0] += x0
+                cont_scaled[..., 1] += y0
+                proj_contours.append(cont_scaled.astype(np.int32))
+
+            if not proj_contours:
+                circle_radius_full, emphasized_full = visuals.emphasize_lines(
+                    sub_target_roi,
+                    (None, dist_roi),
+                    estimated_warped_radius,
+                    telemetry=None,
+                    ring_radius=circle_radius,
+                )
+                fallback_contours = visuals.reproduce_proj_contours(
+                    emphasized_full, (None, dist_roi), bullseye_roi, circle_radius)
+                for cont in fallback_contours:
+                    cont = cont.astype(np.float32)
+                    cont[..., 0] += x0
+                    cont[..., 1] += y0
+                    proj_contours.append(cont.astype(np.int32))
+
+            min_area = max(25.0, (circle_radius * 0.025) ** 2)
+            filtered_contours = [c for c in proj_contours if cv2.contourArea(c) >= min_area]
+            if filtered_contours:
+                proj_contours = filtered_contours
+
+            pixel_distances = pixel_distances_full
 
             self.telemetry_sections['radial_filtering'] += time.perf_counter() - radial_total_start
 
             scoring_start = time.perf_counter()
             suspect_hits = visuals.find_suspect_hits(proj_contours, warped_vertices, scale)
 
+            max_radius = circle_radius + 5.0
+            suspect_hits = [h for h in suspect_hits if h[2] <= max_radius]
             # calculate hits and draw circles around them
             scoreboard = hitsMngr.create_scoreboard(suspect_hits, scale, self.rings_amount, self.inner_diam)
             self.telemetry_sections['hit_scoring'] += time.perf_counter() - scoring_start
@@ -356,3 +442,5 @@ class VideoAnalyzer:
         out.release()
         cv2.destroyAllWindows()
         cv2.waitKey(1)
+
+
