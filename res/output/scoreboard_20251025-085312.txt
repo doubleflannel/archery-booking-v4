@@ -1,0 +1,28 @@
+Run timestamp: 2025-10-25T08:51:04
+Run duration: 2m 08s (-7.3% variance)
+Verified hits: 4
+Grand total: 30
+
+Telemetry (seconds):
+  - Target Detection: 0m 08s
+  - Radial Filtering: 1m 23s
+  -     Radial: Warp + Subtract: 0m 17s
+  -     Radial: Distance Map: 0m 43s
+  -     Radial: Ring Estimate: 0m 00s
+  -     Radial: Threshold/Morph: 0m 05s
+  -     Radial: Line Detect: 0m 05s
+  -     Radial: Contour Reconstruct: 0m 13s
+  - Hit Scoring: 0m 04s
+  - Bookkeeping: 0m 24s
+  -     Bookkeeping: Hit Maintenance: 0m 00s
+  -     Bookkeeping: Grouping: 0m 07s
+  -     Bookkeeping: Overlay/Draw: 0m 01s
+  -     Bookkeeping: I/O (Resize/Display/Write): 0m 16s
+  -     Bookkeeping: Idle/Unaccounted: 0m 00s
+
+Ends (5 arrows per end):
++-----+---------+---------+---------+---------+---------+-------+
+| End | Arrow 1 | Arrow 2 | Arrow 3 | Arrow 4 | Arrow 5 | Total |
++-----+---------+---------+---------+---------+---------+-------+
+| 1   | 9       | 7       | 7       | 7       | -       | 30    |
++-----+---------+---------+---------+---------+---------+-------+
